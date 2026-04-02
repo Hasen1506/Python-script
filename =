@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""
+Enterprise Inventory Simulator — MILP Production Planner
+=========================================================
+Merged: our RM tracking + Gemini's backorder carry-over + yield-adjusted costs.
+Paste into Google Colab (!pip install pulp) or run locally.
+Set USE_GUROBI = True if you have Gurobi.
+
+Every # comment explains the formula. Comments don't affect execution.
+"""
+import pulp
+import math
+
+USE_GUROBI = False
+
+# ============================================================
+# 1. DATA — Auto-exported from simulator. Update via Export button.
+# ============================================================
+
+T = 261  # Working days (Jan=22, Feb=20, Mar=23... already counted)
+
+shelf = 3
+# FG expires after 3 days. Forces frequent small batches.
+
+yield_pct = 0.95
+# 100 raw → 95 sellable. 5% scrap. Affects cost AND RM consumption.
+
+switch_cost = 50
+# $ per BATCH START (not per day). Fires when production resumes after idle.
+# Continuous daily production = ONE switch at start, not 261 switches.
+
+fg_hold_per_day = 0.0216
+# Cream Bun $5×1×24%/365 + Vanilla $10×2×24%/365 + Labor $5×24%/365
+
+material_cost = 27.9  # Cream Bun $5×1 + Vanilla $10×2 + transport $2.90
+labor_cost = 5.0
+unit_prod_cost = (material_cost + labor_cost) / yield_pct
+# $34.63 — pay for inputs, get only yield% output
+
+waste_cost = 5.58   # expired unit = material × (1 - 80% salvage)
+fixed_daily = 100    # rent/insurance/staff regardless of production
+sell_price = 100
+
+backorder_on = False
+bo_penalty = 30 if backorder_on else sell_price
+# True: customer waits, $30/unit delay. False: customer walks, $100 lost.
+
+on_hand_fg = 0       # Starting FG. Set to your actual on-hand.
+fg_ss = 6            # Safety stock TARGET (soft — can dip below)
+ss_penalty = 0.065   # $/unit/day below SS (3× holding = urgency)
+wh_max = 500
+
+demand = [8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,8,8,9,8,8,9,9,8,9,9,9,9,8,9,9,9,9,8,9,9,9,8,9,8,9,9,9,9,10,9,10,9,10,9,10,9,10,9,10,9,10,9,9,10,9,10,9,10,9,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,11,10,11,10,11,10,10,11,10,11,10,10,10,11,10,10,10,11,10,11,10,11,10,9,9,10,9,9,9,10,9,10,9,9,9,10,9,9,9,9,10,9,9,9,10,9,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,11,12,13,12,13,12,12,13,12,13,12,12,13,12,13,12,12,13,12,13,12,13,12,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,9,10,10,10,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10]
+capacity = [21]*261
+
+parts = [
+        {"name": "Cream Bun", "qty": 1, "cost": 5.0, "trans": 0.50,
+             "lt": 3, "hold_pct": 24, "partYield": 0.98,
+                  "moq": 20, "max_order": 200, "rm_cap": 1000},
+                      {"name": "Vanilla", "qty": 2, "cost": 10.0, "trans": 1.20,
+                           "lt": 5, "hold_pct": 24, "partYield": 0.92,
+                                "moq": 50, "max_order": 500, "rm_cap": 2000},
+]
+
+# ============================================================
+# 2. DECISION VARIABLES
+# ============================================================
+model = pulp.LpProblem("MPS", pulp.LpMinimize)
+days = list(range(T))
+n_parts = len(parts)
+max_lt = max(pp["lt"] for pp in parts)
+
+p = {t: pulp.LpVariable(f"produce_{t}", 0, cat="Integer") for t in days}
+# p[t] = FG units to produce on day t (integer — can't make half a cake)
+
+y = {t: pulp.LpVariable(f"active_{t}", cat="Binary") for t in days}
+# y[t] = 1 if line runs on day t. Links to capacity: p[t] ≤ C[t]×y[t]
+
+sw = {t: pulp.LpVariable(f"switch_{t}", cat="Binary") for t in days}
+# sw[t] = 1 if STARTING a batch (idle yesterday, active today)
+# sw[t] ≥ y[t] - y[t-1]: fires only on transition from 0→1
+
+Inv = {t: pulp.LpVariable(f"fg_inv_{t}", 0) for t in range(T + 1)}
+# Inv[t] = FG on hand at END of day t. Inv[0] = starting inventory.
+
+e = {t: pulp.LpVariable(f"expired_{t}", 0) for t in days}
+# e[t] = units expiring on day t (age > shelf). Forced by constraint.
+
+s = {t: pulp.LpVariable(f"shortage_{t}", 0) for t in days}
+# s[t] = unmet demand. Backorder ON: carries to t+1. OFF: forced to 0.
+
+ss_viol = {t: pulp.LpVariable(f"ss_viol_{t}", 0) for t in days}
+# ss_viol[t] = how far below SS. Penalized but not forbidden.
+
+rng_ext = range(-max_lt, T)
+r = {(i, t): pulp.LpVariable(f"order_{i}_{t}", 0, cat="Integer")
+     for i in range(n_parts) for t in rng_ext}
+# r[i,t] = RM units of subpart i ordered on day t. Arrives t + LT[i].
+
+RI = {(i, t): pulp.LpVariable(f"rm_inv_{i}_{t}", 0)
+     for i in range(n_parts) for t in range(T + 1)}
+# RI[i,t] = RM inventory of subpart i at end of day t.
+
+zo = {(i, t): pulp.LpVariable(f"po_flag_{i}_{t}", cat="Binary")
+     for i in range(n_parts) for t in rng_ext}
+# zo[i,t] = 1 if PO placed for subpart i on day t. Links to MOQ.
+
+# ============================================================
+# 3. INITIAL CONDITIONS
+# ============================================================
+model += Inv[0] == on_hand_fg, "init_fg"
+for i in range(n_parts):
+    model += RI[i, 0] == 0, f"init_rm_{i}"
+
+# ============================================================
+# 4. OBJECTIVE — Minimize total cost
+# ============================================================
+obj = pulp.lpSum([
+    switch_cost * sw[t]           # Setup on batch start only
+    + fg_hold_per_day * Inv[t+1]  # FG holding
+    + unit_prod_cost * p[t]       # Production (yield-adjusted)
+    + waste_cost * e[t]           # Expired units
+    + bo_penalty * s[t]           # Shortage (backorder or lost sale)
+    + ss_penalty * ss_viol[t]     # Dipping below safety stock
+    + fixed_daily                 # Fixed overhead
+    for t in days
+])
+for i in range(n_parts):
+    rm_h = parts[i]["cost"] * parts[i]["hold_pct"] / 100 / 365
+    obj += pulp.lpSum([rm_h * RI[i, t+1] for t in days])  # RM holding
+model += obj, "Total_Cost"
+
+# ============================================================
+# 5. CONSTRAINTS
+# ============================================================
+for t in days:
+    # C1: FG FLOW BALANCE
+    if backorder_on and t > 0:
+        # Backorder carry-over: yesterday's shortage adds to today's demand
+        model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - s[t-1] - e[t] + s[t], f"flow_{t}"
+    else:
+        model += Inv[t+1] == Inv[t] + p[t]*yield_pct - demand[t] - e[t] + s[t], f"flow_{t}"
+
+    # C2: CAPACITY
+    model += p[t] <= capacity[t] * y[t], f"cap_{t}"
+
+    # C3: BATCH SWITCH (setup fires on START only)
+    model += sw[t] >= y[t] - (y[t-1] if t > 0 else 0), f"sw_{t}"
+
+    # C4: WAREHOUSE MAX
+    model += Inv[t+1] <= wh_max, f"wh_{t}"
+
+    # C5: SAFETY STOCK (soft)
+    model += ss_viol[t] >= fg_ss - Inv[t+1], f"ss_{t}"
+
+    # C6: NO BACKORDER (if disabled)
+    if not backorder_on:
+        model += s[t] == 0, f"nobo_{t}"
+
+    # C7: SHELF LIFE EXPIRY
+    if t >= shelf:
+        model += (
+            pulp.lpSum([e[tau] for tau in range(max(0, t-shelf+1), t+1)])
+            >= pulp.lpSum([p[tau]*yield_pct for tau in range(max(0, t-2*shelf+1), t-shelf+1)])
+            - pulp.lpSum([demand[tau] for tau in range(max(0, t-2*shelf+1), t-shelf+1)])
+        ), f"shelf_{t}"
+
+    # C8-C10: PER-SUBPART
+    for i in range(n_parts):
+        lt = parts[i]["lt"]
+        od = t - lt
+        # C8: BOM EXPLOSION
+        if -max_lt <= od < T:
+            model += r[i, od] * parts[i]["partYield"] >= p[t] * parts[i]["qty"], f"bom_{i}_{t}"
+            # C9: RM FLOW BALANCE
+            if t > 0:
+                model += RI[i, t] == RI[i, t-1] + r[i, t] - p[t] * parts[i]["qty"], f"rm_{i}_{t}"
+                # C10: RM WAREHOUSE
+                model += RI[i, t] <= parts[i]["rm_cap"], f"rmcap_{i}_{t}"
+
+# C11-C12: MOQ & SUPPLIER MAX
+for i in range(n_parts):
+    for t in rng_ext:
+        model += r[i, t] >= parts[i]["moq"] * zo[i, t], f"moq_{i}_{t}"
+        model += r[i, t] <= parts[i]["max_order"] * zo[i, t], f"mxo_{i}_{t}"
+
+# ============================================================
+# 6. SOLVE & OUTPUT
+# ============================================================
+print("Solving... (1-2 minutes)")
+model.solve(pulp.PULP_CBC_CMD(msg=1, timeLimit=180))
+print(f"\nStatus: {pulp.LpStatus[model.status]}")
+print(f"Total Cost: ${pulp.value(model.objective):,.0f}\n")
+
+print(f"{'Day':>4} {'Dem':>5} {'Prod':>5} {'Inv':>5} {'Exp':>5} {'Short':>5} {'SW':>3}")
+print("-" * 38)
+tp = te = ts = nsw = 0
+for t in days:
+    pv = int(p[t].varValue or 0)
+    iv = Inv[t+1].varValue or 0
+    ev = e[t].varValue or 0
+    sv = s[t].varValue or 0
+    swv = 1 if (sw[t].varValue or 0) > 0.5 else 0
+    tp += pv; te += ev; ts += sv; nsw += swv
+    flag = ""
+    if ev > 0.5: flag = " EXP"
+    if sv > 0.5: flag = " SHORT"
+    if t < 60 or pv > 0 or ev > 0.5 or sv > 0.5:
+        print(f"{t+1:>4} {demand[t]:>5} {pv:>5} {iv:>5.0f} {ev:>5.0f} {sv:>5.0f} {'Y' if swv else '':>3}{flag}")
+
+fill = (sum(demand) - ts) / sum(demand) * 100
+print(f"\nProduced:{tp} Expired:{te:.0f} Short:{ts:.0f} Switches:{nsw} Fill:{fill:.1f}%")
+
+print(f"\nRM ORDERS:")
+for i in range(n_parts):
+    nm = parts[i]["name"]
+    print(f"  {nm}:")
+    tq = npo = 0
+    for t in rng_ext:
+        rv = r[i, t].varValue
+        if rv and rv > 0.5:
+            lt2 = parts[i]["lt"]
+            print(f"    PO day {t+1:>4} qty {int(rv):>5} arrives day {t+lt2+1:>4}")
+            tq += int(rv); npo += 1
+    print(f"    Total: {npo} POs, {tq} units")
+
+import json
+mps = [int(p[t].varValue or 0) for t in days]
+print(f"\n--- JSON for simulator ---")
+print(json.dumps({"source":"MILP","cost":round(pulp.value(model.objective),2),"mps_plan":mps,"fill":round(fill,1)},indent=2))
